@@ -1,0 +1,9 @@
+# compiled golang binary
+golang/cb
+
+# Claude Code internal settings
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc

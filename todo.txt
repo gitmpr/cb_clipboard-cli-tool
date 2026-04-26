@@ -1,0 +1,24 @@
+Multi-shell cb project TODO
+
+Structure
+- bash/: primary, production implementation
+- fish/: fish implementation (feature parity with bash)
+- zsh/: zsh implementation (planned)
+- golang/: Go native binary implementation
+
+Next Steps
+- Implement zsh version with feature parity to bash/fish
+- Separate out a dedicated test framework for the golang native binary
+  (currently reuses bash/cb_test_framework.py; golang deserves its own
+  golang/cb_test_framework.py with ELF-aware defaults and no sourced-mode tests)
+- Add usage-focused README.md at repo root covering all three implementations,
+  installation per shell, and quick-start examples
+- Revise the in-tool help text / usage box (cb -h) across implementations
+- Document installation steps per shell (bash/zsh/fish)
+- Verify OSC 52 behavior across tmux/screen/terminals for each shell
+- Create multi-call shell-dependent executable
+
+ideas:
+append to current clipboard
+show status of current clipboard in bare cb output, instead of just the usage help
+
