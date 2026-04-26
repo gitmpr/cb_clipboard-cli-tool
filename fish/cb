@@ -1,0 +1,582 @@
+#!/usr/bin/env fish
+
+# cb - Universal clipboard utility with clean modular structure
+# Fish shell implementation
+
+# =============================================================================
+# CONSTANTS AND CONFIGURATION
+# =============================================================================
+
+set -g OSC52_TIMEOUT_DEFAULT 2.0
+set -g COLOR_RESET \e'[0m'
+set -g COLOR_ACCENT \e'[0;93m'      # Bright yellow
+set -g COLOR_SUCCESS \e'[0;92m'     # Bright green
+set -g COLOR_WARNING \e'[0;33m'     # Yellow
+set -g COLOR_ERROR \e'[0;31m'       # Red
+set -g COLOR_MUTED \e'[0;90m'       # Bright black/gray
+set -g COLOR_INFO \e'[0;96m'        # Bright cyan
+set -g COLOR_MAGENTA \e'[0;95m'     # Bright magenta
+set -g COLOR_WHITE \e'[1;37m'       # White
+set -g COLOR_BLUE \e'[0;34m'        # Blue
+set -g COLOR_GREEN \e'[0;32m'       # Green
+set -g COLOR_CYAN \e'[0;36m'        # Cyan
+
+# Global flags - use global scope for these
+set -g CB_FORCE_STRING false
+set -g CB_COPY_REALPATH false
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+function debug_log
+    if test "$CB_DEBUG" = "1"; or test "$CB_DEBUG" = "true"
+        printf '%s[DEBUG] %s%s\n' "$COLOR_MUTED" "$argv" "$COLOR_RESET" >&2
+    end
+end
+
+function error_exit
+    printf '%sError: %s%s\n' "$COLOR_ERROR" "$argv" "$COLOR_RESET" >&2
+    exit 1
+end
+
+function warn
+    printf '%sWarning: %s%s\n' "$COLOR_WARNING" "$argv" "$COLOR_RESET" >&2
+end
+
+function info
+    printf '%s%s%s\n' "$COLOR_INFO" "$argv" "$COLOR_RESET" >&2
+end
+
+function success
+    printf '%s%s%s\n' "$COLOR_SUCCESS" "$argv" "$COLOR_RESET" >&2
+end
+
+# =============================================================================
+# CORE FUNCTIONALITY
+# =============================================================================
+
+function copy_to_clipboard
+    set -l content $argv[1]
+
+    # Check if stderr is connected to a terminal for OSC 52 sequences
+    # (skipped when CB_ALLOW_NONINTERACTIVE=1 to allow test contexts)
+    if test "$CB_ALLOW_NONINTERACTIVE" != "1"
+        if not isatty stderr
+            error_exit "Cannot copy to clipboard: stderr must be connected to a terminal for OSC 52 sequences"
+        end
+    end
+
+    # Declare at function scope first — fish's `set -l` is block-scoped (not function-scoped
+    # like bash's `local`), so variables declared inside if/end blocks are gone afterwards.
+    set -l b64_content ""
+    if test (string length -- "$content") -gt 0
+        set b64_content (printf '%s' "$content" | base64 -w0)
+    end
+
+    if test -n "$b64_content"
+        printf '\e]52;c;%s\e\\' "$b64_content" >&2
+    else
+        # Send empty OSC 52 to clear clipboard
+        printf '\e]52;c;\e\\' >&2
+    end
+end
+
+function paste_from_clipboard
+    set -l script_dir (dirname (status current-filename))
+
+    if not command -v python3 >/dev/null 2>&1
+        error_exit "python3 required for paste functionality"
+    end
+
+    debug_log "Attempting to paste from clipboard with timeout: $OSC52_TIMEOUT_DEFAULT"s
+
+    python3 "$script_dir/cb_osc52_paste.py" $OSC52_TIMEOUT_DEFAULT
+    return $status
+end
+
+function get_absolute_path
+    set -l path $argv[1]
+
+    if command -v realpath >/dev/null 2>&1
+        realpath -m "$path" 2>/dev/null; or echo "$path"
+    else
+        # Fallback implementation - handle relative paths properly
+        if string match -q '/*' -- "$path"
+            # Already absolute
+            echo "$path"
+        else if test -e "$path"
+            # File exists - get absolute path via cd
+            echo (cd (dirname "$path") && pwd)/(basename "$path")
+        else
+            # File doesn't exist - resolve relative to current directory
+            set -l current_dir (pwd)
+
+            # Handle . and .. components
+            if string match -q -r '^\.\.?/' -- "$path"; or string match -q -r '/\.\.?/' -- "$path"; or string match -q -r '/\.\.?$' -- "$path"
+                # Path contains . or .. - try to resolve via dirname if parent exists
+                set -l parent_dir (dirname "$path")
+                set -l filename (basename "$path")
+
+                if test -d "$parent_dir"
+                    echo (cd "$parent_dir" && pwd)/$filename
+                else
+                    # Parent doesn't exist, just prepend current directory
+                    echo "$current_dir/$path"
+                end
+            else
+                # Simple relative path without . or ..
+                echo "$current_dir/$path"
+            end
+        end
+    end
+end
+
+function analyze_text
+    set -l text $argv[1]
+    set -l line_count 0
+    set -l char_count (string length -- "$text")
+    set -l has_trailing_nl false
+
+    if test "$char_count" -gt 0
+        # Detect trailing newline: check last character via substring.
+        # Note: string match glob '*\n' in fish matches literal backslash-n (not a newline),
+        # so we use string sub to get the last char and compare via regex.
+        set -l last_char (string sub -s -1 -- "$text")
+        if string match -qr '\n' -- "$last_char"
+            set has_trailing_nl true
+        end
+
+        # Count lines properly
+        if test "$has_trailing_nl" = true
+            set line_count (printf '%s' "$text" | wc -l)
+        else
+            set line_count (math (printf '%s' "$text" | wc -l) + 1)
+        end
+    end
+
+    # Use printf with newlines to create separate items instead of echo with spaces
+    printf '%s\n%s\n%s\n' $line_count $char_count $has_trailing_nl
+end
+
+function is_binary_file
+    set -l filename $argv[1]
+
+    # First check with file command if available
+    if command -v file >/dev/null 2>&1
+        set -l file_type (file -b "$filename" 2>/dev/null; or echo "data")
+
+        # Known binary patterns
+        if string match -q -r '(ELF|PE32|Mach-O|executable.*binary|shared object|relocatable|archive.*compressed|gzip|zip|tar|image data|audio|video|font data)' -- "$file_type"
+            return 0  # is binary
+        end
+
+        # Check for generic binary indicators
+        if string match -q -r '(^data$|^Non-ISO.*binary|^Little-endian|^Big-endian)' -- "$file_type"; or not string match -q -r '(text|script|JSON|XML|ASCII|UTF-8)' -- "$file_type"
+            # Additional check: look for null bytes - use direct od on file
+            if od -An -tx1 -N 1024 "$filename" 2>/dev/null | tr -d ' \n' | grep -q '00' 2>/dev/null
+                return 0  # is binary
+            end
+        end
+    end
+
+    return 1  # not binary or cannot determine
+end
+
+function get_newline_description
+    set -l has_trailing_nl $argv[1]
+    set -l context $argv[2]
+
+    if test "$has_trailing_nl" = true
+        switch $context
+            case stdin
+                echo "$COLOR_MUTED(ends with newline)$COLOR_RESET"
+            case file
+                echo "$COLOR_MUTED(file ends with newline - standard format)$COLOR_RESET"
+            case '*'
+                echo "$COLOR_MUTED(ends with newline)$COLOR_RESET"
+        end
+    else
+        switch $context
+            case stdin
+                echo "$COLOR_INFO(no trailing newline)$COLOR_RESET"
+            case file
+                echo "$COLOR_WARNING(file missing final newline - not POSIX compliant)$COLOR_RESET"
+            case '*'
+                echo "$COLOR_INFO(no trailing newline)$COLOR_RESET"
+        end
+    end
+end
+
+# =============================================================================
+# MAIN HANDLERS
+# =============================================================================
+
+function handle_stdin
+    debug_log "Reading from stdin"
+
+    # Read stdin: use read -z to read the full stream as one string, preserving
+    # all embedded and trailing newlines (fish command substitution would strip/re-split them).
+    set -l input
+    read -z input
+
+    set -l analysis (analyze_text "$input")
+    set -l line_count $analysis[1]
+    set -l char_count $analysis[2]
+    set -l has_trailing_nl $analysis[3]
+
+    set -l nl_desc (get_newline_description "$has_trailing_nl" "stdin")
+
+    if test $char_count -eq 0
+        info "Copying empty content from stdin"
+    else
+        info "Copying content from stdin"
+    end
+
+    copy_to_clipboard "$input"
+    if test $char_count -eq 0
+        echo "$COLOR_MAGENTA✓ Clipboard cleared (empty stdin content)$COLOR_RESET" >&2
+    else
+        echo "$COLOR_MAGENTA✓ Stdin content copied to clipboard: $COLOR_ACCENT$line_count$COLOR_MAGENTA lines, $COLOR_ACCENT$char_count$COLOR_MAGENTA characters$COLOR_RESET" >&2
+    end
+    echo "  $nl_desc" >&2
+end
+
+function handle_realpath
+    set -l path $argv[1]
+    set -l absolute_path (get_absolute_path "$path")
+
+    if test -e "$path"
+        info "Copying absolute path of '$path'"
+    else
+        warn "'$path' does not exist - copying hypothetical absolute path"
+    end
+
+    copy_to_clipboard "$absolute_path"
+    success "✓ Path copied to clipboard: $COLOR_ACCENT$absolute_path$COLOR_SUCCESS"
+end
+
+function handle_file
+    set -l filepath $argv[1]
+
+    if not test -r "$filepath"
+        error_exit "Cannot read file '$filepath' - permission denied"
+    end
+
+    # Check if binary
+    if is_binary_file "$filepath"
+        warn "Copying binary file '$filepath' - content will be copied as-is"
+    else
+        info "Copying text file '$filepath'"
+    end
+
+    # Read file content: use read -z to get the full file as one string, preserving
+    # all embedded and trailing newlines (fish command substitution would strip/re-split them).
+    # Note: read -z exits 1 on empty input (valid for an empty file), so no `or error_exit` —
+    # file existence/readability is already guaranteed by the `test -r` check above.
+    set -l content ""
+    read -z content < "$filepath"
+
+    set -l analysis (analyze_text "$content")
+    set -l line_count $analysis[1]
+    set -l char_count $analysis[2]
+    set -l has_trailing_nl $analysis[3]
+
+    set -l nl_desc (get_newline_description "$has_trailing_nl" "file")
+
+    if test $char_count -eq 0
+        info "File '$filepath' is empty"
+    end
+
+    copy_to_clipboard "$content"
+    if test $char_count -eq 0
+        echo "$COLOR_SUCCESS✓ Clipboard cleared (empty file)$COLOR_RESET" >&2
+    else
+        echo "$COLOR_SUCCESS✓ File contents copied to clipboard: $COLOR_ACCENT$line_count$COLOR_SUCCESS lines, $COLOR_ACCENT$char_count$COLOR_SUCCESS characters$COLOR_RESET" >&2
+    end
+    echo "  $nl_desc" >&2
+end
+
+function handle_string
+    set -l text $argv[1]
+
+    if test "$CB_FORCE_STRING" = true
+        info "Copying literal string argument (forced with -s flag)"
+    else
+        info "Copying string argument"
+    end
+
+    set -l analysis (analyze_text "$text")
+    set -l line_count $analysis[1]
+    set -l char_count $analysis[2]
+    set -l has_trailing_nl $analysis[3]
+
+    set -l nl_desc (get_newline_description "$has_trailing_nl" "string")
+
+    if test $char_count -eq 0
+        info "Copying empty string"
+    end
+
+    copy_to_clipboard "$text"
+    if test $char_count -eq 0
+        echo "$COLOR_WARNING✓ Clipboard cleared (empty string)$COLOR_RESET" >&2
+    else
+        echo "$COLOR_WARNING✓ String copied to clipboard: $COLOR_ACCENT$line_count$COLOR_WARNING lines, $COLOR_ACCENT$char_count$COLOR_WARNING characters$COLOR_RESET" >&2
+    end
+    echo "  $nl_desc" >&2
+end
+
+function handle_paste
+    paste_from_clipboard
+end
+
+# =============================================================================
+# HELP FUNCTIONS
+# =============================================================================
+
+function show_help
+    set -l term_width (tput cols 2>/dev/null; or echo "80")
+
+    # Use box drawing for terminals >= 78 characters wide
+    if test $term_width -ge 78
+        show_help_boxed
+    else
+        show_help_simple
+    end
+end
+
+function show_help_boxed
+    printf "%s╭────────────────────────────────────────────────────────────────────────────╮%s\n" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %scb%s %s- Universal clipboard utility%s                                           %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_INFO" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s├────────────────────────────────────────────────────────────────────────────┤%s\n" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sUsage:%s %scb%s %s[-s] [-r]%s %s[string|filename]%s                                      %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sDescription:%s                                                               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s Copies text or file contents to the clipboard or pastes clipboard contents %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s depending on output destination. Works via OSC 52 escape sequences.        %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s Designed for interactive terminal use only (not scripts).                  %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sCopy Modes:%s                                                                %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %sFrom stdin:%s                                                              %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s      %secho%s %s\"some string\"%s %s|%s %scb%s                                               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %sFrom file:%s                                                               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s      %scb%s %s/path/to/file%s                    %s# Copy file contents%s              %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %sFrom string:%s                                                             %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s      %scb%s %s'some string'%s                    %s# Copy literal string%s             %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sPaste Modes:%s                                                               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %sTo pipe:%s                                                                 %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s      %scb%s %s|%s %ssort%s                           %s# Paste to command%s                %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %sTo file:%s                                                                 %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s      %scb%s %s>%s %soutput.txt%s                     %s# Paste to new file%s               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s      %scb%s %s>>%s %soutput.txt%s                    %s# Append to file%s                  %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sOptions:%s                                                                   %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %s-s%s          Treat argument as literal string (not file path)             %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %s-r%s          Copy absolute path of file instead of contents               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %s-h%s          Show this help message                                       %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sEnvironment:%s                                                               %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %sCB_DEBUG%s    Enable debug output (set to 1 or true)                       %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s                                                                            %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s %sExamples:%s                                                                  %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scat%s %sfile.txt%s %s|%s %scb%s                 %s# Copy file via pipe%s                   %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scb%s %simportant.log%s                  %s# Copy file contents%s                   %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scb%s %s-s%s %sfilename.txt%s                %s# Copy literal string%s                  %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scb%s %sfilename.txt%s %s-s%s                %s# Copy literal string (flexible)%s       %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scb%s %s-r%s %sscript.sh%s                   %s# Copy absolute path%s                   %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %secho%s %s-n%s %s\"\"%s %s|%s %scb%s                   %s# Clear clipboard%s                      %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scb%s %s|%s %sgrep%s %spattern%s                 %s# Paste and filter%s                     %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s│%s   %scb%s %s>%s %sbackup.txt%s                   %s# Paste to file%s                        %s│%s\n" "$COLOR_CYAN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET" "$COLOR_CYAN" "$COLOR_RESET"
+    printf "%s╰────────────────────────────────────────────────────────────────────────────╯%s\n" "$COLOR_CYAN" "$COLOR_RESET"
+end
+
+function show_help_simple
+    printf "%scb%s %s- Universal clipboard utility%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_INFO" "$COLOR_RESET"
+    printf "\n"
+    printf "%sUsage:%s %scb%s %s[-s] [-r]%s %s[string|filename]%s\n" "$COLOR_WARNING" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET"
+    printf "\n"
+    printf "%sDescription:%s\n" "$COLOR_WARNING" "$COLOR_RESET"
+    printf "  Copies text or file contents to the clipboard or pastes clipboard contents\n"
+    printf "  depending on output destination. Works via OSC 52 escape sequences.\n"
+    printf "  Designed for interactive terminal use only (not scripts).\n"
+    printf "\n"
+    printf "%sCopy Modes:%s\n" "$COLOR_WARNING" "$COLOR_RESET"
+    printf "  %sFrom stdin:%s    %secho%s %s\"text\"%s %s|%s %scb%s\n" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET"
+    printf "  %sFrom file:%s     %scb%s %sfilename.txt%s\n" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET"
+    printf "  %sFrom string:%s   %scb%s %s'some text'%s\n" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET"
+    printf "\n"
+    printf "%sPaste Modes:%s\n" "$COLOR_WARNING" "$COLOR_RESET"
+    printf "  %sTo pipe:%s       %scb%s %s|%s %ssort%s\n" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET"
+    printf "  %sTo file:%s       %scb%s %s>%s %soutput.txt%s\n" "$COLOR_SUCCESS" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET"
+    printf "\n"
+    printf "%sOptions:%s\n" "$COLOR_WARNING" "$COLOR_RESET"
+    printf "  %s-s%s    Treat argument as literal string (not file path)\n" "$COLOR_BLUE" "$COLOR_RESET"
+    printf "  %s-r%s    Copy absolute path of file instead of contents\n" "$COLOR_BLUE" "$COLOR_RESET"
+    printf "  %s-h%s    Show this help message\n" "$COLOR_BLUE" "$COLOR_RESET"
+    printf "\n"
+    printf "%sEnvironment:%s\n" "$COLOR_WARNING" "$COLOR_RESET"
+    printf "  %sCB_DEBUG%s    Enable debug output (set to 1 or true)\n" "$COLOR_GREEN" "$COLOR_RESET"
+    printf "\n"
+    printf "%sExamples:%s\n" "$COLOR_WARNING" "$COLOR_RESET"
+    printf "  %scat%s %sfile.txt%s %s|%s %scb%s         %s# Copy file via pipe%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %scb%s %simportant.log%s          %s# Copy file contents%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %scb%s %s-s%s %sfilename.txt%s        %s# Copy literal string%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %scb%s %sfilename.txt%s %s-s%s        %s# Copy literal string (flexible)%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %scb%s %s-r%s %sscript.sh%s           %s# Copy absolute path%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %secho%s %s-n%s %s\"\"%s %s|%s %scb%s           %s# Clear clipboard%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_BLUE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %scb%s %s|%s %sgrep%s %spattern%s         %s# Paste and filter%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+    printf "  %scb%s %s>%s %sbackup.txt%s           %s# Paste to file%s\n" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_WHITE" "$COLOR_RESET" "$COLOR_GREEN" "$COLOR_RESET" "$COLOR_MAGENTA" "$COLOR_RESET"
+end
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+
+function cb
+    # Check if running in appropriate context - cb is designed for interactive use only
+    # Allow override for testing purposes
+    if test "$CB_ALLOW_NONINTERACTIVE" != "1"
+        # Check if we have a proper terminal environment (stdin, stdout, stderr all connected to TTY)
+        # This is a better indicator than shell flags for actual interactive usage
+        if not isatty stdin; or not isatty stdout; or not isatty stderr
+            # Special case: allow stdin from pipe if stdout/stderr are terminals (echo "text" | cb)
+            if not isatty stdin; and isatty stdout; and isatty stderr
+                # This is likely: echo "something" | cb (which is valid)
+                debug_log "Allowing piped stdin to terminal"
+            # Special case: allow stdout redirect if stdin/stderr are terminals (cb > file)
+            else if isatty stdin; and not isatty stdout; and isatty stderr
+                # This is likely: cb > file (paste mode, which is valid)
+                debug_log "Allowing stdout redirect from terminal"
+            else
+                # No proper terminal environment - likely running in a script
+                echo "Error: cb is designed for interactive use only. It will not work correctly in scripts due to OSC 52 terminal requirements." >&2
+                echo "Hint: cb is meant for terminal users, not automation. Use other clipboard tools for scripting." >&2
+                return 1
+            end
+        end
+    end
+
+    # Reset global flags
+    set -g CB_FORCE_STRING false
+    set -g CB_COPY_REALPATH false
+
+    # Parse flags - support both before and after arguments (flexible positioning)
+    set -l args
+    set -l s_flag_count 0
+    set -l r_flag_count 0
+
+    for arg in $argv
+        switch $arg
+            case -s
+                set s_flag_count (math $s_flag_count + 1)
+                if test $s_flag_count -gt 1
+                    error_exit "Invalid option: $arg (flag already specified)"
+                end
+                set -g CB_FORCE_STRING true
+            case -r
+                set r_flag_count (math $r_flag_count + 1)
+                if test $r_flag_count -gt 1
+                    error_exit "Invalid option: $arg (flag already specified)"
+                end
+                set -g CB_COPY_REALPATH true
+            case -h --help
+                show_help
+                return 0
+            case '-*'
+                # Only reject single-letter flags we recognize
+                if string match -q -r '^-[a-zA-Z]$' -- "$arg"
+                    error_exit "Invalid option: $arg"
+                else
+                    # Treat multi-character or unknown dash-prefixed strings as literal arguments
+                    set -a args $arg
+                end
+            case '*'
+                set -a args $arg
+        end
+    end
+
+    # Validate flag combinations
+    if test "$CB_COPY_REALPATH" = true; and test "$CB_FORCE_STRING" = true
+        error_exit "Cannot use -r and -s flags together"
+    end
+
+    # Check for stdin + argument conflicts
+    if test (count $args) -gt 0; and not isatty stdin
+        error_exit "Cannot accept both stdin and an argument"
+    end
+
+    # Validate realpath flag requirements
+    if test "$CB_COPY_REALPATH" = true; and test (count $args) -eq 0
+        error_exit "-r flag requires a file path argument"
+    end
+
+    # Detect paste mode (output is redirected/piped) - but only if no stdin and no args
+    if not isatty stdout; and isatty stdin; and test (count $args) -eq 0
+        handle_paste
+        return
+    end
+
+    # Dispatch based on argument count and context
+    switch (count $args)
+        case 0
+            if isatty stdin
+                show_help >&2
+                return 1
+            else
+                handle_stdin
+            end
+        case 1
+            set -l arg $args[1]
+
+            if test "$CB_COPY_REALPATH" = true
+                handle_realpath "$arg"
+            else if test "$CB_FORCE_STRING" = true
+                handle_string "$arg"
+            else if test -L "$arg"; and not test -e "$arg"
+                # Check for broken symlinks first (before -e check)
+                error_exit "Cannot copy '$arg' - it is a broken symbolic link\nHint: Use -s flag to copy the literal string '$arg' instead"
+            else if test -f "$arg"
+                handle_file "$arg"
+            else if test -e "$arg"
+                # More specific error messages for different file types
+                if test -d "$arg"
+                    if test -L "$arg"
+                        error_exit "Cannot copy '$arg' - it is a symbolic link to a directory, not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                    else
+                        error_exit "Cannot copy '$arg' - it is a directory, not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                    end
+                else if test -p "$arg"
+                    error_exit "Cannot copy '$arg' - it is a named pipe (FIFO), not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                else if test -c "$arg"
+                    error_exit "Cannot copy '$arg' - it is a character device, not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                else if test -b "$arg"
+                    error_exit "Cannot copy '$arg' - it is a block device, not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                else if test -S "$arg"
+                    error_exit "Cannot copy '$arg' - it is a Unix domain socket, not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                else
+                    error_exit "Cannot copy '$arg' - unknown file type, not a regular file\nHint: Use -s flag to copy the literal string '$arg' instead"
+                end
+            else
+                handle_string "$arg"
+            end
+        case '*'
+            error_exit "Too many arguments. Quote your input into a single argument string"
+    end
+end
+
+# =============================================================================
+# SCRIPT EXECUTION
+# =============================================================================
+
+# Only execute if script is run directly (not sourced)
+# $_ is always empty in fish, so we use status flags instead:
+#   not is-interactive: running as a non-interactive script (not in an interactive shell)
+#   not is-block: not inside a block context (fish -c "source ... && ..." sets is-block=true)
+# Together these are only both true when running directly as the main script.
+if not status --is-interactive; and not status --is-block
+    cb $argv
+end
