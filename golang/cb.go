@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -330,12 +330,13 @@ func isBinaryFile(filename string) bool {
 		return false
 	}
 	defer f.Close()
-	buf := make([]byte, 1024)
+	buf := make([]byte, 512)
 	n, err := f.Read(buf)
 	if err != nil && err != io.EOF {
 		return false
 	}
-	return bytes.IndexByte(buf[:n], 0) >= 0
+	contentType := http.DetectContentType(buf[:n])
+	return !strings.HasPrefix(contentType, "text/")
 }
 
 func getAbsolutePath(path string) string {
@@ -361,9 +362,9 @@ func handleStdin() {
 	lineCount, charCount, hasTrailingNL := analyzeInput(content)
 
 	if charCount == 0 {
-		fmt.Fprintf(os.Stderr, "%sCopying empty content from stdin%s\n", colors.Cyan, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying empty content from stdin%s\n", colors.BrightCyan, colors.NC)
 	} else {
-		fmt.Fprintf(os.Stderr, "%sCopying content from stdin%s\n", colors.Cyan, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying content from stdin%s\n", colors.BrightCyan, colors.NC)
 	}
 
 	copyToClipboard(content)
@@ -386,7 +387,7 @@ func handleFile(path string) {
 	if isBinaryFile(path) {
 		fmt.Fprintf(os.Stderr, "%sWarning: Copying binary file '%s' - content will be copied as-is%s\n", colors.Yellow, path, colors.NC)
 	} else {
-		fmt.Fprintf(os.Stderr, "%sCopying text file '%s'%s\n", colors.Cyan, path, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying text file '%s'%s\n", colors.BrightCyan, path, colors.NC)
 	}
 
 	data, err := os.ReadFile(path)
@@ -399,7 +400,7 @@ func handleFile(path string) {
 	lineCount, charCount, hasTrailingNL := analyzeInput(content)
 
 	if charCount == 0 {
-		fmt.Fprintf(os.Stderr, "%sCopying empty file '%s'%s\n", colors.Cyan, path, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying empty file '%s'%s\n", colors.BrightCyan, path, colors.NC)
 	}
 
 	copyToClipboard(content)
@@ -420,9 +421,9 @@ func handleFile(path string) {
 
 func handleString(text string, forced bool) {
 	if forced {
-		fmt.Fprintf(os.Stderr, "%sCopying literal string argument (forced with -s flag)%s\n", colors.Cyan, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying literal string argument (forced with -s flag)%s\n", colors.BrightCyan, colors.NC)
 	} else {
-		fmt.Fprintf(os.Stderr, "%sCopying string argument%s\n", colors.Cyan, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying string argument%s\n", colors.BrightCyan, colors.NC)
 	}
 
 	lineCount, charCount, hasTrailingNL := analyzeInput(text)
@@ -447,7 +448,7 @@ func handleRealpath(path string) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "%sWarning: '%s' does not exist - copying hypothetical absolute path%s\n", colors.Yellow, path, colors.NC)
 	} else {
-		fmt.Fprintf(os.Stderr, "%sCopying absolute path of '%s'%s\n", colors.Cyan, path, colors.NC)
+		fmt.Fprintf(os.Stderr, "%sCopying absolute path of '%s'%s\n", colors.BrightCyan, path, colors.NC)
 	}
 	copyToClipboard(abs)
 	fmt.Fprintf(os.Stderr, "%s✓ Path copied to clipboard: %s%s%s%s\n", colors.Green, colors.BrightYellow, abs, colors.Green, colors.NC)
@@ -747,6 +748,14 @@ func main() {
 				errorExit(fmt.Sprintf("Cannot copy '%s' - it is a directory, not a regular file\nHint: Use -s flag to copy the literal string '%s' instead", arg, arg))
 			} else if mode.IsRegular() {
 				handleFile(arg)
+			} else if mode&os.ModeNamedPipe != 0 {
+				errorExit(fmt.Sprintf("Cannot copy '%s' - it is a named pipe (FIFO)\nHint: Use -s flag to copy the literal string '%s' instead", arg, arg))
+			} else if mode&os.ModeSocket != 0 {
+				errorExit(fmt.Sprintf("Cannot copy '%s' - it is a Unix domain socket\nHint: Use -s flag to copy the literal string '%s' instead", arg, arg))
+			} else if mode&os.ModeDevice != 0 && mode&os.ModeCharDevice != 0 {
+				errorExit(fmt.Sprintf("Cannot copy '%s' - it is a character device\nHint: Use -s flag to copy the literal string '%s' instead", arg, arg))
+			} else if mode&os.ModeDevice != 0 {
+				errorExit(fmt.Sprintf("Cannot copy '%s' - it is a block device\nHint: Use -s flag to copy the literal string '%s' instead", arg, arg))
 			} else {
 				errorExit(fmt.Sprintf("Cannot copy '%s' - unknown file type, not a regular file\nHint: Use -s flag to copy the literal string '%s' instead", arg, arg))
 			}
